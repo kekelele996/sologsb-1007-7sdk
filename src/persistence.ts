@@ -1,8 +1,9 @@
 import { createSeedProject } from "./data";
-import type { PersistedEnvelope, ProjectData } from "./types";
+import type { InboxPackage, PersistedEnvelope, ProjectData } from "./types";
 
 export const STORAGE_KEY = "sologsb-1007-project-v1";
 export const SESSION_KEY = "sologsb-1007-session";
+export const INBOX_KEY = "sologsb-1007-inbox-v1";
 
 export function loadProject(): { project: ProjectData; revision: number } {
   if (typeof localStorage === "undefined") {
@@ -37,6 +38,22 @@ export function readEnvelope(): PersistedEnvelope | null {
   } catch {
     return null;
   }
+}
+
+/** 采集包收件箱：导入的现场包先存这里，不碰编目稿；合并失败也仍在 */
+export function loadInbox(): InboxPackage[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const parsed = JSON.parse(localStorage.getItem(INBOX_KEY) ?? "[]");
+    return Array.isArray(parsed) ? (parsed as InboxPackage[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveInbox(inbox: InboxPackage[]) {
+  if (typeof localStorage === "undefined") return;
+  localStorage.setItem(INBOX_KEY, JSON.stringify(inbox));
 }
 
 export function downloadText(filename: string, content: string, type = "text/plain;charset=utf-8") {

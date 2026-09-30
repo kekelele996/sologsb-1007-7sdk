@@ -13,11 +13,48 @@ import {
   untrack,
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
-import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import {
+  downloadText,
+  formatTime,
+  loadInbox,
+  loadProject,
+  parseTime,
+  saveInbox,
+  saveProject,
+} from "../persistence";
+import {
+  MergeValidationError,
+  buildReport,
+  createCollectionPackage,
+  parseCollectionPackage,
+  planMerge,
+  resolveSegmentFork,
+  summarizeReport,
+  type MergePlan,
+} from "../sync";
+import type {
+  Confidence,
+  InboxPackage,
+  PackageSegmentReport,
+  PersistedEnvelope,
+  ProjectData,
+  Segment,
+  TranscriptTrack,
+} from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
+
+const OUTCOME_LABELS: Record<PackageSegmentReport["outcome"], string> = {
+  "merged-field": "听现场",
+  "merged-catalog": "留编目室",
+  "merged-both": "两边合流",
+  conflict: "两版待挑",
+  unchanged: "未改动",
+  added: "现场新增",
+  split: "已搁置·拆开",
+  missing: "已搁置·不见",
+};
 
 function statusText(status: "saved" | "saving" | "offline") {
   if (status === "saving") return "正在保存";
@@ -114,9 +151,17 @@ export default function OralHistoryEditor() {
   const [helpOpen, setHelpOpen] = createSignal(false);
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
-  const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low" | "forks">("all");
+  const [inbox, setInbox] = createSignal<InboxPackage[]>([]);
+  const [mergeTarget, setMergeTarget] = createSignal<InboxPackage | null>(null);
+  const [mergePlan, setMergePlan] = createSignal<MergePlan | null>(null);
+  const [mergeError, setMergeError] = createSignal("");
+  const [exportOpen, setExportOpen] = createSignal(false);
+  const [collectorName, setCollectorName] = createSignal("");
+  const [lastMergeSummary, setLastMergeSummary] = createSignal("");
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
+  let packageInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
   let hydrated = false;
   let dirty = false;
@@ -131,6 +176,7 @@ export default function OralHistoryEditor() {
     const segments = activeTrack()?.segments ?? [];
     if (trackFilter() === "unreviewed") return segments.filter((segment) => !segment.reviewed);
     if (trackFilter() === "low") return segments.filter((segment) => segment.confidence <= 2 || segment.flags.lowConfidence);
+    if (trackFilter() === "forks") return segments.filter((segment) => segment.conflict);
     return segments;
   });
   const completedPercent = createMemo(() => {
@@ -142,10 +188,10 @@ export default function OralHistoryEditor() {
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
   const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
 
-  const commit = (label: string, mutate: (draft: ProjectData) => void) => {
+  const commit = (label: string, mutate: (draft: ProjectData) => void, baseOverride?: ProjectData) => {
     const current = structuredClone(project());
-    const next = structuredClone(current);
-    mutate(next);
+    const next = structuredClone(baseOverride ?? current);
+    if (!baseOverride) mutate(next);
     next.updatedAt = new Date().toISOString();
     batch(() => {
       setPast((items) => [...items.slice(-49), current]);
@@ -223,6 +269,9 @@ export default function OralHistoryEditor() {
       const original = structuredClone(current);
       current.text = firstText;
       current.end = Number(boundary.toFixed(1));
+      // 血缘：两半共享 originId，供采集包合并时识别“编目室已拆开”
+      const originId = current.originId ?? current.id;
+      current.originId = originId;
       const trackIndex = draft.tracks.findIndex((track) => track.id === draft.activeTrackId);
       if (trackIndex >= 0) {
         const segmentIndex = draft.tracks[trackIndex].segments.findIndex((item) => item.id === current.id);
@@ -233,6 +282,9 @@ export default function OralHistoryEditor() {
           text: secondText,
           reviewed: false,
           comments: [],
+          originId,
+          splitFromId: current.id,
+          conflict: undefined,
         });
       }
       setSelectedId(secondId);
@@ -252,9 +304,15 @@ export default function OralHistoryEditor() {
       current.tagIds = [...new Set([...current.tagIds, ...next.tagIds])];
       current.comments.push(...next.comments);
       current.confidence = Math.min(current.confidence, next.confidence) as Confidence;
+      // 血缘：记录被吞并的片段（含其全部前身），供采集包合并时识别“已并入”
+      current.mergedFromIds = [
+        ...new Set([...(current.mergedFromIds ?? []), next.id, ...(next.mergedFromIds ?? [])]),
+      ];
+      if (next.originId) current.originId = current.originId ?? next.originId;
       const sourceTrack = draft.tracks.find((item) => item.id === draft.activeTrackId);
       sourceTrack?.segments.splice(index + 1, 1);
       current.reviewed = false;
+      current.conflict = undefined;
     });
   };
 
@@ -361,8 +419,127 @@ export default function OralHistoryEditor() {
     setConflict(null);
   };
 
+  // ---------- 平板采集包：下发 / 收件箱 / 合并 ----------
+
+  const refreshInbox = () => setInbox(loadInbox());
+
+  const exportPackage = () => {
+    const pkg = createCollectionPackage(project(), revision(), collectorName());
+    downloadText(
+      `采集包-${project().title}-${pkg.packageId}.json`,
+      JSON.stringify(pkg, null, 2),
+      "application/json;charset=utf-8",
+    );
+    setExportOpen(false);
+    setCollectorName("");
+    setLastAction("已生成采集包，平板可离线校对后再带回合并");
+  };
+
+  const importPackage = async (file: File) => {
+    try {
+      const pkg = parseCollectionPackage(await file.text());
+      const current = loadInbox();
+      if (!current.some((item) => item.pkg.packageId === pkg.packageId)) {
+        // 两边改动各自先存着：进入收件箱暂存，不触碰编目稿
+        const entry: InboxPackage = {
+          pkg,
+          receivedAt: new Date().toISOString(),
+          status: "pending",
+          reports: [],
+          deferred: [],
+        };
+        saveInbox([...current, entry]);
+        refreshInbox();
+        setLastAction(`已暂存采集员「${pkg.collectorName}」的采集包，待编目室合并`);
+      } else {
+        setLastAction("该采集包已在收件箱中，未重复导入");
+      }
+    } catch (error) {
+      setLastAction(error instanceof MergeValidationError ? error.message : "采集包读取失败");
+    }
+  };
+
+  const planFor = (entry: InboxPackage): MergePlan =>
+    planMerge(project(), entry.pkg, entry.status === "merged" ? new Set(entry.deferred.map((item) => item.segmentId)) : undefined);
+
+  const openMergeDialog = (entry: InboxPackage) => {
+    setMergeError("");
+    try {
+      setMergePlan(planFor(entry));
+      setMergeTarget(entry);
+    } catch (error) {
+      setMergeError(error instanceof Error ? error.message : "合并规划失败");
+    }
+  };
+
+  /**
+   * 原子提交：先在内存里完成整份规划（planMerge 不产生副作用），
+   * 再依次写收件箱与编目稿；任一步失败就回滚收件箱、不更新草稿，绝不只并一半。
+   */
+  const applyMerge = () => {
+    const entry = mergeTarget();
+    const plan = mergePlan();
+    if (!entry || !plan) return;
+    const previousInbox = loadInbox();
+    let committedProject: ProjectData;
+    try {
+      const report = buildReport(plan);
+      const nextEntry: InboxPackage = {
+        ...entry,
+        status: "merged",
+        reports: [...entry.reports, report],
+        deferred: plan.deferred,
+      };
+      const otherEntries = previousInbox.filter((item) => item.pkg.packageId !== entry.pkg.packageId);
+      committedProject = structuredClone(plan.merged);
+      committedProject.updatedAt = new Date().toISOString();
+      saveInbox([...otherEntries, nextEntry]);
+      saveProject(committedProject, revision() + 1, TAB_ID);
+    } catch (error) {
+      // 编目稿保存失败时回滚收件箱，两边状态回到合并之前，可原样重试
+      saveInbox(previousInbox);
+      setMergeError(error instanceof Error ? `合并失败，未改动草稿：${error.message}` : "合并失败，未改动草稿");
+      return;
+    }
+    setPast((items) => [...items.slice(-49), structuredClone(project())]);
+    setFuture([]);
+    setProject(committedProject);
+    setRevision((value) => value + 1);
+    setInbox(loadInbox());
+    setLastMergeSummary(`「${entry.pkg.collectorName}」采集包：${summarizeReport(buildReport(plan))}`);
+    setLastAction(`已合并采集包：${summarizeReport(buildReport(plan))}`);
+    dirty = false;
+    setMergeTarget(null);
+    setMergePlan(null);
+  };
+
+  const chooseForkVersion = (segmentId: string, choice: "catalog" | "field") => {
+    try {
+      const next = resolveSegmentFork(project(), segmentId, choice);
+      commit(
+        choice === "catalog" ? "采用编目室版，现场版已移除" : "采用现场版，编目室版已移除",
+        () => {},
+        next,
+      );
+    } catch (error) {
+      setLastAction(error instanceof Error ? error.message : "重挑失败");
+    }
+  };
+
+  const removeInboxEntry = (packageId: string) => {
+    const next = loadInbox().filter((item) => item.pkg.packageId !== packageId);
+    saveInbox(next);
+    setInbox(next);
+    if (mergeTarget()?.pkg.packageId === packageId) {
+      setMergeTarget(null);
+      setMergePlan(null);
+    }
+    setLastAction("已从收件箱移除采集包（编目稿未受影响）");
+  };
+
   onMount(() => {
     hydrated = true;
+    refreshInbox();
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
     const handleStorage = (event: StorageEvent) => {
@@ -452,6 +629,66 @@ export default function OralHistoryEditor() {
     queueMicrotask(() => editorRef?.focus());
   };
 
+  const MergePreview = () => {
+    const entry = mergeTarget();
+    const plan = mergePlan();
+    if (!entry || !plan) return <Dialog.Title>正在规划合并…</Dialog.Title>;
+    const c = plan.counts;
+    const trackName = (trackId: string) =>
+      entry.pkg.field.tracks.find((track) => track.id === trackId)?.name ??
+      project().tracks.find((track) => track.id === trackId)?.name ??
+      trackId;
+    return (
+      <>
+        <Dialog.Title>合并采集包 · {entry.pkg.collectorName}</Dialog.Title>
+        <Dialog.Description>
+          以下发基准（{new Date(entry.pkg.exportedAt).toLocaleDateString()}）逐条三向比对；确认后整包原子合入，失败可重试，不会只并一半。
+        </Dialog.Description>
+        <div class="merge-counts">
+          <span class="mc-field">听现场 {c.mergedField + c.mergedBoth}</span>
+          <span class="mc-add">新增 {c.added}</span>
+          <span class="mc-catalog">留编目室 {c.mergedCatalog}</span>
+          <span class="mc-conflict">两版待挑 {c.conflicts}</span>
+          <span class="mc-defer">搁置 {c.deferred}</span>
+          <span class="mc-skip">未动 {c.unchanged}{plan.skipped ? `（重试跳过 ${plan.skipped}）` : ""}</span>
+        </div>
+        <div class="merge-rows">
+          <For each={plan.rows}>
+            {(r) => (
+              <div class={`merge-row merge-${r.outcome}`}>
+                <span class="merge-badge">{OUTCOME_LABELS[r.outcome]}</span>
+                <span class="merge-track">{trackName(r.trackId)} · {r.segmentId}</span>
+                <span class="merge-detail">{r.detail}</span>
+              </div>
+            )}
+          </For>
+        </div>
+        <Show when={plan.deferred.length}>
+          <p class="merge-defer-note">
+            {plan.deferred.length} 段因编目室已拆开 / 整段不见而搁置，保留在本采集包中；待编目稿处理后点「重试搁置段」即可再并。
+          </p>
+        </Show>
+        <Show when={mergeError()}><p class="merge-error">{mergeError()}</p></Show>
+        <div class="dialog-footer">
+          <button class="btn btn-quiet" onClick={() => { setMergeTarget(null); setMergePlan(null); setMergeError(""); }}>
+            {entry.status === "merged" && !plan.deferred.length ? "关闭" : "取消"}
+          </button>
+          <button
+            class="btn btn-primary"
+            disabled={entry.status === "merged" && !plan.deferred.length}
+            onClick={applyMerge}
+          >
+            {entry.status === "merged"
+              ? plan.deferred.length
+                ? `重试合并 ${plan.deferred.length} 个搁置段`
+                : "已全部并入"
+              : `确认合并（${c.conflicts ? "冲突两版并存" : "自动合流"}）`}
+          </button>
+        </div>
+      </>
+    );
+  };
+
   return (
     <div class="app-shell">
       <Show when={conflict()}>
@@ -534,6 +771,63 @@ export default function OralHistoryEditor() {
             <div class="hint">支持 SRT / VTT / 每行 `[00:12] 文本`</div>
           </section>
 
+          <section class="panel-section inbox-section">
+            <div class="section-title"><h2>平板采集包</h2><span>{inbox().length}</span></div>
+            <div class="inbox-actions">
+              <button class="wide-action" onClick={() => setExportOpen(true)}><span>⇪</span> 下发采集包给平板</button>
+              <button class="wide-action" onClick={() => packageInputRef?.click()}><span>⇩</span> 接入平板校对稿</button>
+            </div>
+            <input
+              ref={packageInputRef}
+              type="file"
+              accept=".json,application/json"
+              hidden
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                if (file) void importPackage(file);
+                event.currentTarget.value = "";
+              }}
+            />
+            <div class="inbox-list">
+              <For each={inbox()} fallback={<div class="mini-empty">收件箱为空。平板接上网后，把校对稿采集包接入这里。</div>}>
+                {(entry) => {
+                  const last = () => entry.reports[entry.reports.length - 1];
+                  return (
+                    <article class={`inbox-card ${entry.status === "pending" ? "pending" : ""}`}>
+                      <header>
+                        <strong>{entry.pkg.collectorName}</strong>
+                        <span class={`inbox-state ${entry.status}`}>{entry.status === "pending" ? "待合并" : entry.deferred.length ? "部分搁置" : "已合并"}</span>
+                      </header>
+                      <small>下发 {new Date(entry.pkg.exportedAt).toLocaleString()}</small>
+                      <small>接入 {new Date(entry.receivedAt).toLocaleString()}</small>
+                      <Show when={last()}>
+                        {(report) => (
+                          <p class="inbox-summary">
+                            {summarizeReport(report())}
+                            <Show when={entry.deferred.length}>
+                              <em>（{entry.deferred.length} 段搁置，可重试）</em>
+                            </Show>
+                          </p>
+                        )}
+                      </Show>
+                      <div class="inbox-buttons">
+                        <button class="btn btn-primary" onClick={() => openMergeDialog(entry)}>
+                          {entry.status === "pending"
+                            ? "查看并合并"
+                            : entry.deferred.length
+                              ? `重试搁置段（${entry.deferred.length}）`
+                              : "查看上次合并报告"}
+                        </button>
+                        <button class="btn btn-quiet" title="移出收件箱（不影响编目稿）" onClick={() => removeInboxEntry(entry.pkg.packageId)}>移除</button>
+                      </div>
+                    </article>
+                  );
+                }}
+              </For>
+            </div>
+            <div class="hint">导入先进收件箱暂存，两边改动都不丢；确认后才原子合并。</div>
+          </section>
+
           <section class="panel-section tag-summary">
             <div class="section-title"><h2>标注实体</h2><span>{project().tags.length}</span></div>
             <div class="legend">
@@ -555,6 +849,7 @@ export default function OralHistoryEditor() {
               <button class={trackFilter() === "all" ? "active" : ""} onClick={() => setTrackFilter("all")}>全部</button>
               <button class={trackFilter() === "unreviewed" ? "active" : ""} onClick={() => setTrackFilter("unreviewed")}>未校对</button>
               <button class={trackFilter() === "low" ? "active" : ""} onClick={() => setTrackFilter("low")}>低置信</button>
+              <button class={trackFilter() === "forks" ? "active" : ""} onClick={() => setTrackFilter("forks")}>待重挑</button>
             </div>
           </div>
 
@@ -565,7 +860,7 @@ export default function OralHistoryEditor() {
                   id={`segment-${segment.id}`}
                   role="option"
                   aria-selected={segment.id === selectedId()}
-                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""}`}
+                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""} ${segment.conflict ? "forked" : ""}`}
                   onClick={() => clickSegment(segment.id)}
                 >
                   <div class="segment-rail" style={{ background: speakerById(segment.speakerId)?.color ?? "#64748b" }} />
@@ -581,8 +876,30 @@ export default function OralHistoryEditor() {
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
                       <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                      <Show when={segment.conflict}>
+                        <span class="pill fork">{segment.conflict!.role === "catalog" ? "编目室版" : "现场版"} · 待重挑</span>
+                      </Show>
                     </div>
                     <p>{segment.text}</p>
+                    <Show when={segment.conflict}>
+                      <div class="fork-strip" onClick={(event) => event.stopPropagation()}>
+                        <span>两边都改了：{segment.conflict!.fields.join("、")}，两版并存</span>
+                        <div class="fork-actions">
+                          <button
+                            class={`fork-pick ${segment.conflict!.role === "catalog" ? "chosen" : ""}`}
+                            onClick={() => chooseForkVersion(segment.id, "catalog")}
+                          >
+                            采用编目室版
+                          </button>
+                          <button
+                            class={`fork-pick field ${segment.conflict!.role === "field" ? "chosen" : ""}`}
+                            onClick={() => chooseForkVersion(segment.id, "field")}
+                          >
+                            采用现场版
+                          </button>
+                        </div>
+                      </div>
+                    </Show>
                     <div class="segment-tags">
                       <For each={segment.tagIds.map(tagById).filter(Boolean)}>
                         {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
@@ -610,6 +927,32 @@ export default function OralHistoryEditor() {
                 </Tabs.List>
 
                 <Tabs.Content value="correct" class="tab-content">
+                  <Show when={segment().conflict}>
+                    <div class="inspector-fork">
+                      <header>
+                        <strong>两版待重挑 · {segment().conflict!.fields.join("、")}</strong>
+                        <span>当前这版是{segment().conflict!.role === "catalog" ? "编目室版" : "现场版"}，姊妹片段就在列表相邻位置</span>
+                      </header>
+                      <div class="fork-compare">
+                        <div class={segment().conflict!.role === "catalog" ? "is-self" : ""}>
+                          <i>编目室版</i>
+                          <b>{speakerById(segment().conflict!.catalogVersion.speakerId)?.name ?? "未知发言人"}</b>
+                          <time>{formatTime(segment().conflict!.catalogVersion.start, false)} – {formatTime(segment().conflict!.catalogVersion.end, false)}</time>
+                          <p>{segment().conflict!.catalogVersion.text}</p>
+                        </div>
+                        <div class={segment().conflict!.role === "field" ? "is-self" : ""}>
+                          <i>现场版</i>
+                          <b>{speakerById(segment().conflict!.fieldVersion.speakerId)?.name ?? "未知发言人"}</b>
+                          <time>{formatTime(segment().conflict!.fieldVersion.start, false)} – {formatTime(segment().conflict!.fieldVersion.end, false)}</time>
+                          <p>{segment().conflict!.fieldVersion.text}</p>
+                        </div>
+                      </div>
+                      <div class="fork-actions">
+                        <button class="btn btn-quiet" onClick={() => chooseForkVersion(segment().id, "catalog")}>采用编目室版</button>
+                        <button class="btn btn-primary" onClick={() => chooseForkVersion(segment().id, "field")}>采用现场版</button>
+                      </div>
+                    </div>
+                  </Show>
                   <div class="inspector-heading">
                     <div><span>片段 {activeTrack().segments.findIndex((item) => item.id === segment().id) + 1}</span><strong>{formatTime(segment().start, false)} — {formatTime(segment().end, false)}</strong></div>
                     <button class={`review-button ${segment().reviewed ? "done" : ""}`} onClick={() => commitSegment("标记片段已校对", (item) => { item.reviewed = true; })}>
@@ -722,9 +1065,43 @@ export default function OralHistoryEditor() {
 
       <footer class="statusbar">
         <span>最近操作：{lastAction()}</span>
+        <Show when={lastMergeSummary()}><span class="merge-summary">{lastMergeSummary()}</span></Show>
         <span>版本 {revision() + 1} · 本地草稿</span>
         <span class="status-shortcuts">J/K 浏览　R 已校对　M 合并　? 帮助</span>
       </footer>
+
+      <Dialog open={exportOpen()} onOpenChange={setExportOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content">
+            <Dialog.Title>下发采集包给平板</Dialog.Title>
+            <Dialog.Description>
+              采集包内置当前编目稿作为共同基准，平板可完全离线校对；接回网络后从「接入平板校对稿」导入合并。
+            </Dialog.Description>
+            <label class="field-label" for="collector-name">现场采集员</label>
+            <input
+              id="collector-name"
+              value={collectorName()}
+              placeholder="如：小林（码头组）"
+              onInput={(event) => setCollectorName(event.currentTarget.value)}
+            />
+            <p class="dialog-note">包内含当前修订号 {revision() + 1} 与全部 {project().tracks.length} 条轨道的快照。</p>
+            <div class="dialog-footer">
+              <button class="btn btn-quiet" onClick={() => setExportOpen(false)}>取消</button>
+              <button class="btn btn-primary" onClick={exportPackage}>生成并下载采集包</button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
+
+      <Dialog open={!!mergeTarget()} onOpenChange={(open) => !open && (setMergeTarget(null), setMergePlan(null), setMergeError(""))}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content merge-dialog">
+            {mergeTarget() ? <MergePreview /> : <Dialog.Title>正在规划合并…</Dialog.Title>}
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
 
       <Dialog open={helpOpen()} onOpenChange={setHelpOpen}>
         <Dialog.Portal>
