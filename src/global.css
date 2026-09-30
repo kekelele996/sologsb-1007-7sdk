@@ -200,3 +200,40 @@ kbd { padding: 2px 5px; border: 1px solid rgba(0,0,0,.15); border-bottom-width: 
   .top-actions { gap: 5px; }
   .network-chip { display: none; }
 }
+
+/* 合并采集包 */
+.merge-actions { margin-top: 12px; display: grid; gap: 2px; }
+.merge-actions .wide-action { margin-top: 0; }
+.merge-primary { border-style: solid; border-color: #d9a05b; background: #fdf3e3; color: #8a5a1e; }
+.merge-primary:hover { background: #fbe7c8; }
+.merge-dialog { width: min(640px, calc(100vw - 40px)); max-height: 86vh; overflow-y: auto; }
+.merge-meta { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 11px; color: #68737c; margin-bottom: 12px; }
+.merge-stats { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.merge-stats .stat { padding: 5px 11px; border-radius: 999px; font-size: 11px; font-weight: 650; }
+.merge-stats .clean { background: #e3f0e6; color: #1d6b35; }
+.merge-stats .conflict { background: #fdecc8; color: #8a5a1e; }
+.merge-stats .added { background: #e2ecf5; color: #28609d; }
+.merge-stats .aside { background: #f0ecec; color: #7a5252; }
+.merge-section { margin-top: 14px; }
+.merge-section h3 { margin: 0 0 8px; font-size: 13px; color: #33414b; }
+.conflict-card { border: 1px solid #e2d9c6; border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: #fffdf8; }
+.conflict-card header { display: flex; justify-content: space-between; gap: 10px; font-size: 11px; color: #68737c; margin-bottom: 8px; }
+.conflict-card header strong { color: #33414b; }
+.conflict-versions { display: grid; gap: 6px; }
+.conflict-versions label { display: flex; align-items: flex-start; gap: 7px; padding: 7px 9px; border: 1px solid #e3e0d8; border-radius: 8px; cursor: pointer; font-size: 11px; color: #4a5560; }
+.conflict-versions label.picked { border-color: #d9a05b; background: #fdf3e3; }
+.conflict-versions label b { color: #33414b; }
+.conflict-versions label span { line-height: 1.5; }
+.merge-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.merge-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 7px 10px; border: 1px solid #e3e0d8; border-radius: 8px; font-size: 11px; color: #4a5560; background: #fffdf8; }
+.merge-list li strong { color: #33414b; }.merge-list .reason { padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 650; }
+.merge-list .reason.missing { background: #fdecc8; color: #8a5a1e; }
+.merge-list .reason.split { background: #fbe3e3; color: #a02828; }
+.merge-list .reason.track-missing { background: #f0ecec; color: #7a5252; }
+.merge-list .reason.duplicate { background: #e2ecf5; color: #28609d; }
+.merge-error { border: 1px solid #e5c6c6; background: #fdf1f1; border-radius: 10px; padding: 12px 14px; }
+.merge-error strong { color: #a02828; font-size: 13px; }
+.merge-error p { margin: 6px 0 0; color: #7a4a4a; font-size: 11px; }
+.merge-pick { padding: 18px 0 6px; text-align: center; }
+.merge-pick p { margin-bottom: 14px; }
+.merge-footer { gap: 8px; }

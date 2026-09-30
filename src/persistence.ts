@@ -3,6 +3,21 @@ import type { PersistedEnvelope, ProjectData } from "./types";
 
 export const STORAGE_KEY = "sologsb-1007-project-v1";
 export const SESSION_KEY = "sologsb-1007-session";
+export const SYNC_BASE_KEY = "sologsb-1007-sync-base";
+
+/** 上次同步基线：导出采集包时随包带上，供现场设备做三段合并 */
+export function loadSyncBase(): ProjectData | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SYNC_BASE_KEY) ?? "") as ProjectData;
+    return parsed?.id ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveSyncBase(project: ProjectData) {
+  localStorage.setItem(SYNC_BASE_KEY, JSON.stringify(project));
+}
 
 export function loadProject(): { project: ProjectData; revision: number } {
   if (typeof localStorage === "undefined") {

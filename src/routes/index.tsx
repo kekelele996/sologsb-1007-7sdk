@@ -13,7 +13,16 @@ import {
   untrack,
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
-import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
+import {
+  buildMergedProject,
+  computeMerge,
+  createFieldPackage,
+  parseFieldPackage,
+  reasonText,
+  setConflictChoice,
+} from "../merge";
+import { downloadText, formatTime, loadProject, loadSyncBase, parseTime, saveProject, saveSyncBase } from "../persistence";
+import type { FieldPackage, MergeResult } from "../merge";
 import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
@@ -115,8 +124,13 @@ export default function OralHistoryEditor() {
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [mergeOpen, setMergeOpen] = createSignal(false);
+  const [mergeResult, setMergeResult] = createSignal<MergeResult | null>(null);
+  const [mergeError, setMergeError] = createSignal<string | null>(null);
+  const [mergeFileName, setMergeFileName] = createSignal("");
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
+  let mergeFileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
   let hydrated = false;
   let dirty = false;
@@ -361,8 +375,89 @@ export default function OralHistoryEditor() {
     setConflict(null);
   };
 
+  const resetMergeDialog = () => {
+    setMergeResult(null);
+    setMergeError(null);
+    setMergeFileName("");
+    if (mergeFileInputRef) mergeFileInputRef.value = "";
+  };
+
+  const openMergeDialog = () => {
+    resetMergeDialog();
+    setMergeOpen(true);
+  };
+
+  const exportFieldPackage = () => {
+    const pkg = createFieldPackage(project(), loadSyncBase() ?? undefined, "编目室设备");
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadText(`采集包-${project().title}-${stamp}.json`, JSON.stringify(pkg, null, 2), "application/json");
+    setLastAction("已导出采集包，可交给现场采集员离线校对");
+  };
+
+  const handlePackageFile = async (file: File) => {
+    setMergeFileName(file.name);
+    let text: string;
+    try {
+      text = await file.text();
+    } catch {
+      setMergeError("读取文件失败，请重试。");
+      setMergeResult(null);
+      return;
+    }
+    const parsed = parseFieldPackage(text);
+    if (!parsed.ok) {
+      setMergeError(parsed.error);
+      setMergeResult(null);
+      return;
+    }
+    try {
+      const result = computeMerge(parsed.pkg, project());
+      setMergeResult(result);
+      setMergeError(null);
+    } catch {
+      // 计算过程中出现任何异常都不触碰草稿，排除问题后可直接重试
+      setMergeError("合并计算失败，草稿未受影响。请重新选择采集包文件重试。");
+      setMergeResult(null);
+    }
+  };
+
+  const applyMerge = () => {
+    const result = mergeResult();
+    if (!result) return;
+    try {
+      const merged = buildMergedProject(result);
+      saveSyncBase(merged);
+      commit("合并现场采集包", (draft) => {
+        draft.tracks = merged.tracks;
+        draft.updatedAt = merged.updatedAt;
+      });
+      setMergeOpen(false);
+      resetMergeDialog();
+    } catch {
+      setMergeError("应用合并时失败，草稿未受影响。请重试。");
+    }
+  };
+
+  const conflictSegments = () => mergeResult()?.segments.filter((item) => item.kind === "conflict") ?? [];
+  const addedSegments = () => mergeResult()?.segments.filter((item) => item.kind === "added") ?? [];
+  const setAsideItems = () => mergeResult()?.setAsides ?? [];
+  const trackName = (trackId: string) => project().tracks.find((track) => track.id === trackId)?.name ?? trackId;
+  const segmentIndex = (trackId: string, segmentId: string) =>
+    (project().tracks.find((track) => track.id === trackId)?.segments.findIndex((item) => item.id === segmentId) ?? -1) + 1;
+  const conflictCounts = () => {
+    const result = mergeResult();
+    if (!result) return { clean: 0, conflict: 0, added: 0, setAside: 0 };
+    return {
+      clean: result.segments.filter((item) => item.kind === "clean").length,
+      conflict: result.segments.filter((item) => item.kind === "conflict").length,
+      added: result.segments.filter((item) => item.kind === "added").length,
+      setAside: result.setAsides.length,
+    };
+  };
+
   onMount(() => {
     hydrated = true;
+    if (!loadSyncBase()) saveSyncBase(project());
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
     const handleStorage = (event: StorageEvent) => {
@@ -532,6 +627,11 @@ export default function OralHistoryEditor() {
             />
             <button class="wide-action" onClick={() => fileInputRef?.click()}><span>＋</span> 导入带时间码文本</button>
             <div class="hint">支持 SRT / VTT / 每行 `[00:12] 文本`</div>
+            <div class="merge-actions">
+              <button class="wide-action" onClick={exportFieldPackage}><span>↥</span> 导出采集包（交现场离线校对）</button>
+              <button class="wide-action merge-primary" onClick={openMergeDialog}><span>↧</span> 合并现场采集包</button>
+            </div>
+            <div class="hint">合并按片段逐条对照：正文、发言人、时间听现场；关联、批注、已校对以编目室为准；两边都改的片段留两版重挑，拆开或不见的片段先搁着。</div>
           </section>
 
           <section class="panel-section tag-summary">
@@ -743,6 +843,136 @@ export default function OralHistoryEditor() {
               <span><kbd>?</kbd> 显示本帮助</span>
             </div>
             <div class="dialog-footer"><button class="btn btn-primary" onClick={() => setHelpOpen(false)}>开始校对</button></div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
+
+      <Dialog open={mergeOpen()} onOpenChange={(open) => { if (!open) resetMergeDialog(); setMergeOpen(open); }}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content merge-dialog">
+            <Dialog.Title>合并现场采集包</Dialog.Title>
+            <Dialog.Description>
+              现场平板离线校对的记录按片段与本草稿逐条对照：正文、发言人、起止时间听现场记录；主题关联、批注和已校对状态以编目室为准；同一片段两边都改过的会留两版供重挑；在编目室已拆开或整段不见的片段先搁着。确认后才会并入草稿，失败可重试。
+            </Dialog.Description>
+
+            <Show when={mergeError()}>
+              <div class="merge-error" role="alert">
+                <strong>采集包未能合并，草稿未受影响</strong>
+                <p>{mergeError()}</p>
+                <div class="dialog-footer">
+                  <button class="btn btn-primary" onClick={() => mergeFileInputRef?.click()}>重新选择文件</button>
+                </div>
+              </div>
+            </Show>
+
+            <Show when={!mergeError() && mergeResult()}>
+              {(result) => {
+                const counts = conflictCounts();
+                return (
+                  <>
+                    <div class="merge-meta">
+                      <span>采集包设备：{result().pkg.device ?? "未知"}</span>
+                      <span>导出于 {new Date(result().pkg.exportedAt).toLocaleString()}</span>
+                      <Show when={mergeFileName()}><span>文件：{mergeFileName()}</span></Show>
+                    </div>
+                    <div class="merge-stats">
+                      <span class="stat clean">自动合并 {counts.clean} 段</span>
+                      <span class="stat conflict">待重挑 {counts.conflict} 段</span>
+                      <span class="stat added">现场新增 {counts.added} 段</span>
+                      <span class="stat aside">先搁着 {counts.setAside} 段</span>
+                    </div>
+
+                    <Show when={conflictSegments().length}>
+                      <section class="merge-section">
+                        <h3>两边都改过 · 请重挑（{conflictSegments().length}）</h3>
+                        <For each={conflictSegments()}>
+                          {(sm) => (
+                            <div class="conflict-card">
+                              <header>
+                                <strong>{trackName(sm.trackId)}</strong>
+                                <span>片段 {segmentIndex(sm.trackId, sm.segmentId)} · {formatTime(sm.fieldSegment.start, false)}–{formatTime(sm.fieldSegment.end, false)}</span>
+                              </header>
+                              <div class="conflict-versions">
+                                <label class={sm.choice === "merged" ? "picked" : ""}>
+                                  <input type="radio" name={`pick-${sm.segmentId}`} checked={sm.choice === "merged"} onChange={() => setMergeResult(setConflictChoice(result(), sm.segmentId, "merged"))} />
+                                  <span><b>合并版（推荐）</b>正文/发言人/时间用现场，关联/批注/已校对用编目室</span>
+                                </label>
+                                <label class={sm.choice === "field" ? "picked" : ""}>
+                                  <input type="radio" name={`pick-${sm.segmentId}`} checked={sm.choice === "field"} onChange={() => setMergeResult(setConflictChoice(result(), sm.segmentId, "field"))} />
+                                  <span><b>现场版</b>「{sm.fieldSegment.text.slice(0, 26)}{sm.fieldSegment.text.length > 26 ? "…" : ""}」</span>
+                                </label>
+                                <label class={sm.choice === "catalog" ? "picked" : ""}>
+                                  <input type="radio" name={`pick-${sm.segmentId}`} checked={sm.choice === "catalog"} onChange={() => setMergeResult(setConflictChoice(result(), sm.segmentId, "catalog"))} />
+                                  <span><b>编目室版</b>「{sm.catalogSegment?.text.slice(0, 26)}{(sm.catalogSegment?.text.length ?? 0) > 26 ? "…" : ""}」</span>
+                                </label>
+                              </div>
+                            </div>
+                          )}
+                        </For>
+                      </section>
+                    </Show>
+
+                    <Show when={addedSegments().length}>
+                      <section class="merge-section">
+                        <h3>现场新增片段（{addedSegments().length}）</h3>
+                        <ul class="merge-list">
+                          <For each={addedSegments()}>
+                            {(sm) => (
+                              <li>
+                                <strong>{trackName(sm.trackId)}</strong>
+                                <span>片段 {formatTime(sm.fieldSegment.start, false)}–{formatTime(sm.fieldSegment.end, false)}：{sm.fieldSegment.text.slice(0, 40)}{sm.fieldSegment.text.length > 40 ? "…" : ""}</span>
+                              </li>
+                            )}
+                          </For>
+                        </ul>
+                      </section>
+                    </Show>
+
+                    <Show when={setAsideItems().length}>
+                      <section class="merge-section">
+                        <h3>先搁着 · 未并入（{setAsideItems().length}）</h3>
+                        <ul class="merge-list aside-list">
+                          <For each={setAsideItems()}>
+                            {(item) => (
+                              <li>
+                                <span class={`reason ${item.reason}`}>{reasonText[item.reason]}</span>
+                                <strong>{trackName(item.trackId)}</strong>
+                                <span>{item.detail}（{item.segmentId}）</span>
+                              </li>
+                            )}
+                          </For>
+                        </ul>
+                      </section>
+                    </Show>
+
+                    <div class="dialog-footer merge-footer">
+                      <button class="btn btn-quiet" onClick={() => { resetMergeDialog(); setMergeOpen(false); }}>取消</button>
+                      <button class="btn btn-primary" onClick={applyMerge}>应用合并</button>
+                    </div>
+                  </>
+                );
+              }}
+            </Show>
+
+            <Show when={!mergeResult() && !mergeError()}>
+              <div class="merge-pick">
+                <p>选择从现场平板导出的采集包文件（.json）。两边改动会各自保留，确认后才并入草稿。</p>
+                <button class="btn btn-primary" onClick={() => mergeFileInputRef?.click()}>选择采集包文件</button>
+              </div>
+            </Show>
+
+            <input
+              ref={mergeFileInputRef}
+              type="file"
+              accept=".json,application/json"
+              hidden
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                if (file) void handlePackageFile(file);
+                event.currentTarget.value = "";
+              }}
+            />
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog>
