@@ -1,0 +1,22 @@
+{
+  "name": "sologsb-1007-oral-history-editor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build && node scripts/emit-static.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@kobalte/core": "^0.13.14",
+    "@solidjs/router": "^0.16.0",
+    "@solidjs/start": "^2.0.5",
+    "solid-js": "^1.9.15"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1"
+  }
+}

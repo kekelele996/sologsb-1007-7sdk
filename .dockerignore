@@ -1,0 +1,12 @@
+node_modules
+dist
+server
+tmp
+.output
+.astro
+.git
+.gitignore
+npm-debug.log*
+Dockerfile
+.dockerignore
+README.md
